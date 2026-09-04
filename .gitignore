@@ -1,0 +1,49 @@
+# =========================
+# Runtime / generated data
+# =========================
+data/
+logs/
+cache/
+archive/
+__pycache__/
+*.pyc
+
+# =========================
+# Databases
+# =========================
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+
+# =========================
+# Secrets / local config
+# =========================
+.env
+.env.*
+*.key
+*.pem
+*.token
+secrets.*
+credentials.*
+
+# =========================
+# Local / OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Editors
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# Python
+# =========================
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
