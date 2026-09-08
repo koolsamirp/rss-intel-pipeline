@@ -1,2 +1,5 @@
 #!/bin/bash
-~/ai_env/bin/python ~/.rss-intel-pipeline/security_query.py
+set -euo pipefail
+PYTHON="${PYTHON:-python3}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"$PYTHON" "$HERE/security_query.py"

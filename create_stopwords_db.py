@@ -5,8 +5,9 @@ Run this once to initialize the database
 """
 
 import json
-import duckdb
 from pathlib import Path
+
+import duckdb
 
 # ============================================
 # STOPWORDS CATEGORIZED (DEDUPLICATED)
@@ -276,7 +277,7 @@ def create_stopwords_db():
     security_count = conn.execute("SELECT COUNT(*) FROM security_terms").fetchone()[0]
     geo_count = conn.execute("SELECT COUNT(*) FROM geopolitical_terms").fetchone()[0]
     
-    print(f"\n✅ Database Created Successfully!")
+    print("\n✅ Database Created Successfully!")
     print(f"   📊 Stopwords: {stopword_count}")
     print(f"   🔒 Security Terms: {security_count}")
     print(f"   🌍 Geopolitical Terms: {geo_count}")

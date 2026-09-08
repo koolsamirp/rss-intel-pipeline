@@ -4,9 +4,11 @@ Security Intelligence Report - Quick daily security summary
 Run: ~/ai_env/bin/python ~/.rss-intel-pipeline/security_query.py
 """
 
-import duckdb
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+
+import duckdb
+
 
 def main():
     rss_db = Path.home() / ".rss-intel-pipeline" / "rss_intel.duckdb"
@@ -26,12 +28,12 @@ def main():
     all_important = {**security_words, **geo_words}
     
     # Get today's word counts
-    word_counts = rss.execute(f"""
+    word_counts = rss.execute("""
         SELECT word, SUM(count) as total
         FROM word_history
-        WHERE date = '{today}'
+        WHERE date = ?
         GROUP BY word
-    """).fetchall()
+    """, (today,)).fetchall()
     
     # Filter and score
     results = []
@@ -60,7 +62,7 @@ def main():
     security_total = sum(r['count'] for r in results if r['type'] == 'security')
     geo_total = sum(r['count'] for r in results if r['type'] == 'geopolitical')
     
-    print(f"\n📊 Summary:")
+    print("\n📊 Summary:")
     print(f"   Total Important Terms: {total}")
     print(f"   🔒 Security: {security_total}")
     print(f"   🌍 Geopolitical: {geo_total}")
@@ -74,7 +76,7 @@ def main():
     
     cve_matches = [r for r in results if 'cve' in r['word'].lower() or 'vulnerability' in r['word'].lower()]
     if cve_matches:
-        print(f"\n🛡️ Vulnerability-related terms:")
+        print("\n🛡️ Vulnerability-related terms:")
         for r in cve_matches:
             print(f"   {r['word']}: {r['count']} mentions")
     

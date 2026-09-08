@@ -4,31 +4,33 @@ RSS Intelligence Pipeline - v3.1 (Hotfix)
 Fixes: datetime JSON serialization, report scope bug, signal SQL column order
 """
 
-import sys
-import json
-import gzip
-import re
-import time
-import hashlib
-import logging
-import gc
 import argparse
+import contextlib
+import gc
+import gzip
+import hashlib
+import json
+import logging
+import re
+import sys
+import time
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Any
-from collections import Counter
+from typing import Any
+
+import duckdb
+import feedparser
 
 # ─── Third-party ───
 import requests
-import feedparser
-import duckdb
 from bs4 import BeautifulSoup
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from textblob import TextBlob
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ─── Config import with fallbacks ───
 try:
-    from config import *
+    from config import *  # noqa: F403 (config is the intended source of all settings)
 except ImportError:
     print("⚠️  config.py not found — using defaults")
 
@@ -37,7 +39,8 @@ BASE_DIR = Path(__file__).parent.resolve()
 LOGS_DIR = getattr(sys.modules[__name__], 'LOGS_DIR', BASE_DIR / "logs")
 CACHE_DIR = getattr(sys.modules[__name__], 'CACHE_DIR', BASE_DIR / "cache")
 ARCHIVE_DIR = getattr(sys.modules[__name__], 'ARCHIVE_DIR', BASE_DIR / "archive")
-DB_PATH = getattr(sys.modules[__name__], 'DB_PATH', BASE_DIR / "rss_intel.db")
+DB_PATH = getattr(sys.modules[__name__], 'DB_PATH', BASE_DIR / "rss_intel.duckdb")
+STOPWORDS_DB_PATH = getattr(sys.modules[__name__], 'STOPWORDS_DB_PATH', BASE_DIR / "stopwords.duckdb")
 FEEDS_FILE = getattr(sys.modules[__name__], 'FEEDS_FILE', BASE_DIR / "feeds.json")
 
 USER_AGENT = getattr(sys.modules[__name__], 'USER_AGENT', 'RSS-Intel-Bot/3.1')
@@ -110,7 +113,7 @@ def die(msg: str):
 def cache_path(date_str: str) -> Path:
     return CACHE_DIR / f"articles_{date_str}.json"
 
-def save_cache(articles: List[Dict], date_str: str):
+def save_cache(articles: list[dict], date_str: str):
     if not articles:
         print("  ⚠️  Not saving empty cache")
         return
@@ -119,12 +122,12 @@ def save_cache(articles: List[Dict], date_str: str):
         json.dump(articles, f, indent=2)
     print(f"  💾 Cached {len(articles)} articles → {cp}")
 
-def load_cache(date_str: str) -> List[Dict]:
+def load_cache(date_str: str) -> list[dict]:
     cp = cache_path(date_str)
     if not cp.exists():
         return []
     try:
-        with open(cp, 'r') as f:
+        with open(cp) as f:
             data = json.load(f)
         if not isinstance(data, list):
             print(f"  ⚠️  Cache corrupt (not a list): {cp}")
@@ -188,8 +191,9 @@ class DatabaseManager:
         self._init_schema()
     
     def _init_schema(self):
-        self.conn.execute("DROP SEQUENCE IF EXISTS sw_seq")
-        self.conn.execute("CREATE SEQUENCE sw_seq START 1")
+        # Idempotent: never DROP here. This method runs on every startup, so
+        # dropping/recreating the sequence would reset signal_words IDs to 1 each run.
+        self.conn.execute("CREATE SEQUENCE IF NOT EXISTS sw_seq START 1")
         
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS articles (
@@ -271,7 +275,7 @@ class DatabaseManager:
         """)
         self.conn.commit()
     
-    def insert_articles(self, articles: List[Dict]):
+    def insert_articles(self, articles: list[dict]):
         if not articles:
             return
         rows = []
@@ -294,7 +298,7 @@ class DatabaseManager:
         """, rows)
         self.conn.commit()
     
-    def insert_daily_summary(self, date: str, summary: Dict):
+    def insert_daily_summary(self, date: str, summary: dict):
         self.conn.execute("""
             INSERT OR REPLACE INTO daily_summary
             (date, total_articles, feeds_active, total_topics, top_keywords,
@@ -312,7 +316,7 @@ class DatabaseManager:
         ))
         self.conn.commit()
     
-    def insert_feed_health(self, feed_name: str, status: Dict):
+    def insert_feed_health(self, feed_name: str, status: dict):
         self.conn.execute("""
             INSERT OR REPLACE INTO feed_health
             (feed_name, check_date, status, response_time, article_count, error_message)
@@ -324,7 +328,7 @@ class DatabaseManager:
         ))
         self.conn.commit()
     
-    def insert_word_history(self, word_stats: Dict[str, Dict]):
+    def insert_word_history(self, word_stats: dict[str, dict]):
         today = datetime.now().date().isoformat()
         for word, stats in word_stats.items():
             self.conn.execute("""
@@ -333,7 +337,7 @@ class DatabaseManager:
             """, (word, today, stats['count'], stats['total_articles'], stats['normalized']))
         self.conn.commit()
     
-    def insert_signal_words(self, signals: List[Dict]):
+    def insert_signal_words(self, signals: list[dict]):
         for s in signals:
             self.conn.execute("""
                 INSERT INTO signal_words (word, date, signal_strength, detection_methods, z_score, classification)
@@ -345,7 +349,7 @@ class DatabaseManager:
             ))
         self.conn.commit()
     
-    def get_all_words_last_7_days(self) -> Dict[str, int]:
+    def get_all_words_last_7_days(self) -> dict[str, int]:
         try:
             res = self.conn.execute("""
                 SELECT word, SUM(count) as total
@@ -357,7 +361,7 @@ class DatabaseManager:
         except Exception:
             return {}
     
-    def get_word_history(self, word: str, days: int = 30) -> List[Dict]:
+    def get_word_history(self, word: str, days: int = 30) -> list[dict]:
         try:
             res = self.conn.execute("""
                 SELECT date, count, normalized_frequency
@@ -385,7 +389,7 @@ class DatabaseManager:
         if not rows:
             return
         cols = [d[0] for d in self.conn.description]
-        articles = [dict(zip(cols, r)) for r in rows]
+        articles = [dict(zip(cols, r, strict=False)) for r in rows]
         
         # FIX: serialize datetime/date objects for JSON
         def json_default(o):
@@ -414,7 +418,7 @@ class FeedFetcher:
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': USER_AGENT})
     
-    def fetch(self, url: str, name: str) -> Dict[str, Any]:
+    def fetch(self, url: str, name: str) -> dict[str, Any]:
         result = {
             'status': 'OK', 'articles': [], 'response_time': 0.0,
             'error_message': '', 'article_count': 0
@@ -443,10 +447,8 @@ class FeedFetcher:
             for entry in parsed.entries[:MAX_ARTICLES_PER_FEED]:
                 pub = datetime.now()
                 if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                    try:
+                    with contextlib.suppress(Exception):
                         pub = datetime(*entry.published_parsed[:6])
-                    except Exception:
-                        pass
                 
                 result['articles'].append({
                     'title': entry.get('title', '').strip(),
@@ -503,7 +505,7 @@ class KeywordExtractor:
             clean = re.sub(r'<[^>]+>', ' ', text)
             return re.sub(r'\s+', ' ', clean).strip()
     
-    def extract(self, text: str) -> List[str]:
+    def extract(self, text: str) -> list[str]:
         if not text or len(text.strip()) < 20:
             return []
         
@@ -535,7 +537,7 @@ class KeywordExtractor:
 
 
 class TopicDetector:
-    def detect(self, text: str, keywords: List[str]) -> List[str]:
+    def detect(self, text: str, keywords: list[str]) -> list[str]:
         topics = set()
         text_l = text.lower()
         for topic, patterns in TOPIC_RULES.items():
@@ -552,9 +554,27 @@ class TopicDetector:
 class SentimentAnalyzer:
     def __init__(self):
         self.vader = SentimentIntensityAnalyzer()
-        self.lexicon = CUSTOM_SENTIMENT_LEXICON
-    
-    def analyze(self, text: str) -> Dict[str, Any]:
+        self.lexicon = self._normalize_lexicon(CUSTOM_SENTIMENT_LEXICON)
+
+    @staticmethod
+    def _normalize_lexicon(lexicon: dict[str, float]) -> dict[str, float]:
+        """Normalize a custom lexicon to the [-1, 1] polarity scale.
+
+        VADER's compound score and TextBlob's polarity are both on [-1, 1], and the
+        blend below assumes the custom lexicon shares that scale. Some configs, however,
+        express the lexicon as a [0, 1] "positivity" score (0 = most negative,
+        1 = most positive). Feeding those raw makes a threat term like 'breach' (0.2)
+        register as slightly positive. Detect that case (no negative entries, max <= 1)
+        and remap v -> 2v - 1 so threats contribute negative polarity.
+        """
+        if not lexicon:
+            return {}
+        values = lexicon.values()
+        if min(values) >= 0.0 and max(values) <= 1.0:
+            return {w: (2.0 * v - 1.0) for w, v in lexicon.items()}
+        return dict(lexicon)
+
+    def analyze(self, text: str) -> dict[str, Any]:
         if not text or len(text.strip()) < 20:
             return {'score': 0.0, 'label': 'neutral', 'components': {}}
         
@@ -571,11 +591,16 @@ class SentimentAnalyzer:
         
         score = max(-1.0, min(1.0, v * 0.25 + b * 0.20 + custom * 0.30 + word_based * 0.25))
         
-        if score >= 0.6: label = 'very_positive'
-        elif score >= 0.2: label = 'positive'
-        elif score >= -0.2: label = 'neutral'
-        elif score >= -0.6: label = 'negative'
-        else: label = 'very_negative'
+        if score >= 0.6:
+            label = 'very_positive'
+        elif score >= 0.2:
+            label = 'positive'
+        elif score >= -0.2:
+            label = 'neutral'
+        elif score >= -0.6:
+            label = 'negative'
+        else:
+            label = 'very_negative'
         
         return {'score': score, 'label': label, 'components': {'vader': v, 'textblob': b, 'custom': custom}}
 
@@ -588,7 +613,7 @@ class RiskScorer:
         'malware': 0.2, 'phishing': 0.15
     }
     
-    def score(self, category: str, topics: List[str], text: str) -> float:
+    def score(self, category: str, topics: list[str], text: str) -> float:
         if RISK_MODE == "none":
             return 0.0
         priority = FEED_PRIORITY.get(category, 0.3)
@@ -605,8 +630,30 @@ class RiskScorer:
 class WordStatsAnalyzer:
     def __init__(self, db: DatabaseManager):
         self.db = db
-    
-    def analyze(self, articles: List[Dict]) -> Dict[str, Any]:
+        self.stopwords = self._load_stopwords()
+
+    @staticmethod
+    def _load_stopwords() -> set:
+        """Load the curated stopwords built by create_stopwords_db.py, if present.
+
+        Without this filter the "top words" report is dominated by grammar words
+        ('with', 'from', 'said'). Falls back to the small built-in set so a fresh
+        checkout (no stopwords DB yet) still produces reasonable output.
+        """
+        words = set(KeywordExtractor.STOPWORDS)
+        try:
+            if STOPWORDS_DB_PATH.exists():
+                con = duckdb.connect(str(STOPWORDS_DB_PATH), read_only=True)
+                try:
+                    rows = con.execute("SELECT word FROM stopwords").fetchall()
+                    words.update(r[0] for r in rows)
+                finally:
+                    con.close()
+        except (duckdb.Error, OSError) as e:
+            print(f"  ⚠️  Could not load curated stopwords ({e}); using built-in set")
+        return words
+
+    def analyze(self, articles: list[dict]) -> dict[str, Any]:
         if not articles:
             return self._empty_stats()
         
@@ -616,7 +663,8 @@ class WordStatsAnalyzer:
         for a in articles:
             raw = f"{a.get('title', '')} {a.get('summary', '')}"
             text = KeywordExtractor._strip_html(raw).lower()
-            words = re.findall(r'\b[a-zA-Z]{3,}\b', text)
+            words = [w for w in re.findall(r'\b[a-zA-Z]{3,}\b', text)
+                     if w not in self.stopwords]
             word_counts.update(words)
             article_word_counts.append(len(words))
         
@@ -679,10 +727,14 @@ class WordStatsAnalyzer:
             z = abs(s['z_score'])
             if z > Z_SCORE_THRESHOLD:
                 strength = min(z / 5, 1.0)
-                if strength >= CRITICAL_THRESHOLD: cls = 'CRITICAL_SIGNAL'
-                elif strength >= HIGH_THRESHOLD: cls = 'HIGH_SIGNAL'
-                elif strength >= MEDIUM_THRESHOLD: cls = 'MEDIUM_SIGNAL'
-                else: cls = 'LOW_SIGNAL'
+                if strength >= CRITICAL_THRESHOLD:
+                    cls = 'CRITICAL_SIGNAL'
+                elif strength >= HIGH_THRESHOLD:
+                    cls = 'HIGH_SIGNAL'
+                elif strength >= MEDIUM_THRESHOLD:
+                    cls = 'MEDIUM_SIGNAL'
+                else:
+                    cls = 'LOW_SIGNAL'
                 signals.append({
                     'word': w, 'signal_strength': strength,
                     'detection_methods': ['z_score'], 'z_score': s['z_score'],
@@ -729,7 +781,7 @@ class ReportGenerator:
     def __init__(self, db: DatabaseManager):
         self.db = db
     
-    def generate(self, articles: List[Dict], feed_stats: Dict, word_stats: Dict,
+    def generate(self, articles: list[dict], feed_stats: dict, word_stats: dict,
                  total_feeds: int, from_cache: bool = False) -> str:
         today = datetime.now().strftime('%Y-%m-%d')
         lim = REPORT_LIMITS
@@ -772,21 +824,21 @@ class ReportGenerator:
             lines.append("")
         
         if secs.get('new_words', True) and word_stats['new_words']:
-            lines.append(f"## 🆕 New Words (First Appearance)\n| Word | Count |")
+            lines.append("## 🆕 New Words (First Appearance)\n| Word | Count |")
             lines.append("|------|-------|")
             for w, c in list(word_stats['new_words'].items())[:lim['new_words']]:
                 lines.append(f"| {w} | {c} |")
             lines.append("")
         
         if secs.get('resurrected_words', True) and word_stats['resurrected_words']:
-            lines.append(f"## 🔄 Resurrected Words\n| Word | 7-Day Count |")
+            lines.append("## 🔄 Resurrected Words\n| Word | 7-Day Count |")
             lines.append("|------|-------------|")
             for w, c in list(word_stats['resurrected_words'].items())[:lim['resurrected_words']]:
                 lines.append(f"| {w} | {c} |")
             lines.append("")
         
         if secs.get('dropped_words', True) and word_stats['dropped_words']:
-            lines.append(f"## 📉 Dropped Words\n| Word | 7-Day Count |")
+            lines.append("## 📉 Dropped Words\n| Word | 7-Day Count |")
             lines.append("|------|-------------|")
             for w, c in list(word_stats['dropped_words'].items())[:lim['dropped_words']]:
                 lines.append(f"| {w} | {c} |")
@@ -904,10 +956,8 @@ def main():
                     'status': result['status'], 'articles': 0,
                     'error': result.get('error_message', '')
                 }
-                try:
+                with contextlib.suppress(Exception):
                     db.insert_feed_health(name, result)
-                except Exception:
-                    pass
                 continue
             
             processed = []
@@ -956,10 +1006,8 @@ def main():
                 db_batch = []
                 gc.collect()
             
-            try:
+            with contextlib.suppress(Exception):
                 db.insert_feed_health(name, result)
-            except Exception:
-                pass
         
         if db_batch:
             try:
@@ -993,7 +1041,7 @@ def main():
     summary = {
         'total_articles': len(all_articles),
         'feeds_active': sum(1 for s in feed_stats.values() if s.get('status') == 'OK'),
-        'total_topics': len(set(t for a in all_articles for t in a.get('topics', []))),
+        'total_topics': len({t for a in all_articles for t in a.get('topics', [])}),
         'top_keywords': {},
         'risk_topics': {},
         'top_articles': [],

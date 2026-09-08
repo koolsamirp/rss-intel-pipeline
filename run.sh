@@ -1,9 +1,14 @@
 #!/bin/bash
-# One command: Run pipeline + show security report
+# One command: run the pipeline, then print the security report.
+set -euo pipefail
+
+# Use $PYTHON if set, else the active python3 on PATH.
+PYTHON="${PYTHON:-python3}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "🚀 Running RSS Intelligence Pipeline..."
-~/ai_env/bin/python ~/.rss-intel-pipeline/main.py
+"$PYTHON" "$HERE/main.py" "$@"
 
 echo ""
 echo "🔒 Security Intelligence Report:"
-~/ai_env/bin/python ~/.rss-intel-pipeline/report.py
+"$PYTHON" "$HERE/security_query.py"
