@@ -1,0 +1,10 @@
+# RSS Intelligence Pipeline - runtime dependencies
+# Pinned to compatible-release ranges: patch/minor updates allowed, majors are not.
+requests~=2.32
+feedparser~=6.0
+duckdb~=1.1
+beautifulsoup4~=4.12
+vaderSentiment~=3.3
+textblob~=0.18
+
+# Dev / test dependencies live in requirements-dev.txt

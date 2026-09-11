@@ -3,7 +3,6 @@
 RSS Intelligence Pipeline - Configuration File (Memory Optimized)
 """
 
-import os
 from pathlib import Path
 
 # ============================================

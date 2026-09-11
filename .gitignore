@@ -2,6 +2,7 @@
 # Runtime / generated data
 # =========================
 data/
+!data/feeds.example.json
 logs/
 cache/
 archive/
